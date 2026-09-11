@@ -43,7 +43,9 @@
 #include "windows_compat.h"
 #include "windows_platform.h"
 #else
+#if defined(__APPLE__)
 #include <mach/mach_time.h>
+#endif
 #include <pthread.h>
 #include <unistd.h>
 #endif
@@ -165,6 +167,7 @@ static SDL_Texture *s_texture;
 static SDL_AudioDeviceID s_audio_device;
 static SDL_GameController *s_controllers[2];
 #define s_controller s_controllers[0]
+void   LinuxDefaults(Dkc1Controls *c);
 static Dkc1Controls s_controls;
 static uint32_t s_host_actions, s_previous_host_actions;
 static int s_fast_forward, s_rewinding;
@@ -280,9 +283,15 @@ static int RunStartupScript(char *error, size_t error_size) {
   return 1;
 }
 
+#if defined(__APPLE__)
 static double FramePacerNow(void) {
   return (double)mach_absolute_time();
 }
+#else
+  static double FramePacerNow(void) {
+  return (double)SDL_GetPerformanceCounter();
+}
+#endif
 
 static void FramePacerCpuRelax(void) {
 #if defined(__aarch64__) || defined(__arm64__)
@@ -300,6 +309,7 @@ static void FramePacerCpuRelax(void) {
  * display target into alternating short/long Metal submissions. Relative
  * millisecond sleeps still accumulate phase error, so keep the deadline
  * absolute and absorb only the observed final-wake variance here. */
+#if defined(__APPLE__)
 static void FramePacerWaitUntil(double deadline, double frequency) {
   const double spin_ticks = frequency * kMacFinalSpinSeconds;
   double now = FramePacerNow();
@@ -308,7 +318,23 @@ static void FramePacerWaitUntil(double deadline, double frequency) {
   while (FramePacerNow() < deadline)
     FramePacerCpuRelax();
 }
+#else
+static void FramePacerWaitUntil(double deadline, double frequency) {
+  const double spin_ticks = frequency * kMacFinalSpinSeconds;
+  double now = FramePacerNow();
+  if (deadline - now > spin_ticks) {
+    double diff_seconds = (deadline - spin_ticks - now) / frequency;
+    struct timespec ts;
+    ts.tv_sec = (time_t)diff_seconds;
+    ts.tv_nsec = (long)((diff_seconds - (double)ts.tv_sec) * 1000000000.0);
+    nanosleep(&ts, NULL);
+  }
+  while (FramePacerNow() < deadline)
+    FramePacerCpuRelax();
+}
+#endif
 
+#if defined(__APPLE__)
 static void FramePacerInit(Dkc1FramePacer *pacer) {
   mach_timebase_info_data_t timebase = {0, 0};
   mach_timebase_info(&timebase);
@@ -327,6 +353,19 @@ static void FramePacerInit(Dkc1FramePacer *pacer) {
   pacer->title_window_start = pacer->previous_present;
   pacer->interval_min = DBL_MAX;
 }
+#else
+static void FramePacerInit(Dkc1FramePacer *pacer) {
+  memset(pacer, 0, sizeof *pacer);
+  pacer->frequency = (double)SDL_GetPerformanceFrequency();
+  pacer->ticks_per_frame =
+      pacer->frequency / kHostPresentationFramesPerSecond;
+  pacer->next_deadline = FramePacerNow() + pacer->ticks_per_frame;
+  pacer->estimated_work_ticks = pacer->frequency / 500.0;
+  pacer->previous_present = FramePacerNow();
+  pacer->title_window_start = pacer->previous_present;
+  pacer->interval_min = DBL_MAX;
+}
+#endif
 
 static void FramePacerReanchor(Dkc1FramePacer *pacer, double now) {
   /* next_deadline is the intended scanout boundary, while submission occurs
@@ -465,7 +504,8 @@ static void DisplayPacerRecord(Dkc1DisplayPacer *display,
 }
 
 static int DisplayPacerWaitForTarget(Dkc1FramePacer *pacer,
-                                     Dkc1DisplayPacer *display) {
+                                   Dkc1DisplayPacer *display) {
+#if defined(__APPLE__)
   for (;;) {
     double timestamp = 0.0;
     double target_timestamp = 0.0;
@@ -510,6 +550,11 @@ static int DisplayPacerWaitForTarget(Dkc1FramePacer *pacer,
               s_host_frame + 1, target_lead * 1000.0 / pacer->frequency);
     }
   }
+#else
+  (void)pacer;
+  (void)display;
+  return 0;
+#endif
 }
 
 static void DisplayPacerPrintStats(const Dkc1DisplayPacer *display) {
@@ -803,6 +848,7 @@ static void UpdateWindowTitle(void) {
 
 static void UpdateTitle(void) {
   UpdateWindowTitle();
+#if defined(__APPLE__)
   Dkc1MacUpdateMenuState(s_paused, s_fullscreen,
                          s_fullscreen_scaling,
                          Dkc1VideoGetAspect(), Dkc1VideoGetEdgePolicy(),
@@ -810,6 +856,7 @@ static void UpdateTitle(void) {
                          Dkc1DebugProvenanceOverlay(), s_msu1 != NULL,
                          Dkc1BabyKongEnabled(), Dkc1BabyKongReady());
   Dkc1MacUpdateGraphicsMenuState(s_graphics.display,s_graphics.upscaler,s_graphics.screen);
+#endif
 }
 
 static char *ConfiguredMusicPackPath(void) {
@@ -823,10 +870,15 @@ static char *ConfiguredMusicPackPath(void) {
       memcpy(copy, configured, size);
     return copy;
   }
+#if defined(__APPLE__)
   return Dkc1MacSavedMsu1();
+#else
+  return NULL;
+#endif
 }
 
 static void ChooseBabyKongRom(void) {
+#if defined(__APPLE__)
   char *path = Dkc1MacChooseBabyKongRom();
   if (!path)
     return;
@@ -842,6 +894,9 @@ static void ChooseBabyKongRom(void) {
     snprintf(s_status, sizeof s_status, "Baby Kong: %.160s", error);
   }
   free(path);
+#else
+  snprintf(s_status, sizeof s_status, "Baby Kong ROM selection not supported on this platform");
+#endif
 }
 
 static uint16_t ReadWram16(size_t address) {
@@ -874,8 +929,12 @@ static int ResolveRomPath(int argc, char **argv, char output[PATH_MAX]) {
   const char *candidate = argc > 1 ? argv[1] : getenv("DKC1_ROM");
   char *picked = NULL;
   if (!candidate || !*candidate) {
+#if defined(__APPLE__)
     picked = Dkc1MacChooseRom();
     candidate = picked;
+#else
+    candidate = NULL;
+#endif
   }
   if (!candidate) {
     output[0] = 0;
@@ -916,11 +975,13 @@ static void ApplyPresentationGeometry(void) {
 #endif
   s_presentation_output_width = 0;
   s_presentation_output_height = 0;
+#if defined(__APPLE__)
   if (s_metal_presenter_active) {
     Dkc1MacMetalPresenterSetGeometry(PresentationWidth(), s_fullscreen);
     Dkc1MacMetalPresenterSetScaling(s_fullscreen_scaling);
     Dkc1MacMetalPresenterSetGraphics(&s_graphics);
   }
+#endif
   if (s_texture) {
     /* Retain exact source pixels. Smooth avoids differently sized output
      * columns at a fractional Retina scale; Pixel Sharp keeps hard nearest-
@@ -928,7 +989,11 @@ static void ApplyPresentationGeometry(void) {
     (void)SDL_SetTextureScaleMode(
         s_texture,
         s_fullscreen &&
-                s_fullscreen_scaling != kDkc1MacFullscreenPixelSharp
+#if defined(__APPLE__)
+            s_fullscreen_scaling != kDkc1MacFullscreenPixelSharp
+#else
+            0
+#endif
             ? SDL_ScaleModeLinear
             : SDL_ScaleModeNearest);
   }
@@ -957,8 +1022,14 @@ static void ApplyWindowedSize(void) {
 }
 
 static bool InitVideo(void) {
-  const int window_width = PresentationWidth() * s_graphics.window_scale;
-  const int window_height = kDkc1VideoHeight * s_graphics.window_scale;
+  int window_width = PresentationWidth() * s_graphics.window_scale;
+  int window_height = kDkc1VideoHeight * s_graphics.window_scale;
+
+  #if defined(__linux__)
+  window_height = 360;
+  window_width = 480;
+  #endif
+
   s_window = SDL_CreateWindow(
       "DKC1Recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
       window_width, window_height,
@@ -1025,8 +1096,8 @@ static bool InitVideo(void) {
 }
 
 static void InitDisplayLink(void) {
-#ifdef _WIN32
-  return; /* QPC owns emulation cadence; Windows uses the OpenGL presenter. */
+#if defined(_WIN32) || defined(__linux__)
+  return; /* Non-macOS platforms rely on standard SDL/OpenGL pacing. */
 #else
   SDL_SysWMinfo window_info;
   SDL_VERSION(&window_info.version);
@@ -1060,10 +1131,6 @@ static void InitDisplayLink(void) {
   }
   if (s_display_link_active && s_renderer_vsync &&
       !EnvironmentEnabled("DKC1_KEEP_RENDERER_VSYNC")) {
-    /* CADisplayLink is the opted-in scanout authority. A second blocking-vsync gate in
-     * SDL can quantize an otherwise timely Metal submission onto the following
-     * refresh. macOS remains composited; disabling this wait does not permit
-     * direct scanout tearing. */
     if (SDL_RenderSetVSync(s_renderer, 0) == 0) {
       s_renderer_vsync = 0;
     } else {
@@ -1090,9 +1157,10 @@ static void PreparePresentation(void) {
   if (!display) display=s_pixels;
 #ifdef _WIN32
   Dkc1WindowsGraphicsDraw((const uint32_t *)display,s_width,kDkc1VideoHeight,
-                         PresentationWidth(),&s_graphics);
+                          PresentationWidth(),&s_graphics);
   return;
 #endif
+#if defined(__APPLE__)
   if (s_metal_presenter_active) {
     Dkc1MacPresentationFrameInfo info = {
       .host_frame = s_host_frame,
@@ -1108,6 +1176,7 @@ static void PreparePresentation(void) {
         PresentationWidth(), &info);
     return;
   }
+#endif
   SDL_Rect destination;
   SDL_Rect *destination_ptr = NULL;
   if (s_fullscreen) {
@@ -1306,6 +1375,7 @@ static int16_t UpPositiveAxis(SDL_GameController *pad, SDL_GameControllerAxis ax
 
 static uint32_t PollInput(void) {
   s_host_actions = 0;
+
   if (!(SDL_GetWindowFlags(s_window) & SDL_WINDOW_INPUT_FOCUS) ||
       (SDL_GetModState() & KMOD_GUI)) return 0;
   const uint8_t *keys = SDL_GetKeyboardState(NULL);
@@ -1360,6 +1430,7 @@ static uint32_t PollInput(void) {
     if (!result && !s_host_actions) s_input_release_gate=0;
     s_host_actions=0; return 0;
   }
+
   return result;
 }
 
@@ -1479,7 +1550,8 @@ static void PumpAudio(void) {
   frames = Dkc1AudioStretchProcess(&s_audio_stretch, s_audio_ratio,
       s_audio_scratch, frames, s_audio_output, kAudioScratchFrames + 16);
   const Uint32 bytes = (Uint32)frames * kAudioChannels * sizeof(int16_t);
-  int volume=s_graphics.audio_enabled ? s_graphics.volume : 0;
+  int volume=s_graphics.audio_enabled ? s_graphics.volume : 100;
+
   if (volume!=100) for (int i=0;i<frames*kAudioChannels;i++)
     s_audio_output[i]=(int16_t)((int)s_audio_output[i]*volume/100);
   if (SDL_QueueAudio(s_audio_device, s_audio_output, bytes) != 0) {
@@ -1543,7 +1615,9 @@ static void CaptureRewind(void) {
 
 static void ReconcileHostTimeline(void) {
   ResetAudioTimeline();
+#if defined(__APPLE__)
   Dkc1MacMetalPresenterFlush();
+#endif
   Dkc1Msu1Reset(s_msu1);
   ObserveMsu1MusicState();
   s_stomp_probe = (Dkc1StompProbe){0};
@@ -1625,6 +1699,7 @@ static void ExportRepro(void) {
 /* Switch only the host presentation width. The cartridge state is left
  * untouched, while the existing visible frame is center-cropped or centered
  * over black so a paused aspect change is immediately intelligible. */
+
 static void SetAspectMode(Dkc1VideoAspect requested) {
   const Dkc1VideoAspect old_aspect = Dkc1VideoGetAspect();
   if (old_aspect == requested)
@@ -1667,7 +1742,10 @@ static void SetAspectMode(Dkc1VideoAspect requested) {
   s_texture = new_texture;
 #endif
   s_width = new_width;
-  s_graphics.aspect=requested; Dkc1MacSaveGraphics(&s_graphics);
+  s_graphics.aspect=requested; 
+#if defined(__APPLE__)
+  Dkc1MacSaveGraphics(&s_graphics);
+#endif
   Dkc1BeginDrawing(s_pixels, (size_t)s_width * 4);
   ApplyPresentationGeometry();
   if (!s_fullscreen)
@@ -1688,7 +1766,10 @@ static void SetFullscreen(int fullscreen) {
     snprintf(s_status, sizeof s_status, "fullscreen change failed: %.170s",
              SDL_GetError());
   }
-  s_graphics.fullscreen=s_fullscreen; Dkc1MacSaveGraphics(&s_graphics);
+  s_graphics.fullscreen=s_fullscreen; 
+#if defined(__APPLE__)
+  Dkc1MacSaveGraphics(&s_graphics);
+#endif
   ApplyPresentationGeometry();
   if (!s_fullscreen)
     ApplyWindowedSize();
@@ -1702,8 +1783,10 @@ static void SetFullscreenScaling(Dkc1MacFullscreenScaling scaling) {
     scaling = kDkc1MacFullscreenSharpBilinear;
   s_fullscreen_scaling = scaling;
   s_graphics.upscaler=scaling==kDkc1MacFullscreenSmooth ? kDkc1UpscalerBilinear : scaling==kDkc1MacFullscreenPixelSharp ? kDkc1UpscalerNearest : kDkc1UpscalerSharpBilinear;
+#if defined(__APPLE__)
   Dkc1MacSaveGraphics(&s_graphics);
   Dkc1MacSetFullscreenScaling(s_fullscreen_scaling);
+#endif
   ApplyPresentationGeometry();
   static const char *const names[] = {
     "smooth", "sharp bilinear", "pixel sharp"
@@ -1721,8 +1804,13 @@ static void SetEdgePolicy(Dkc1EdgePolicy policy) {
   if (policy < kDkc1EdgeReflect || policy >= kDkc1EdgePolicyCount)
     policy = kDkc1EdgeGlide;
   Dkc1VideoSetEdgePolicy(policy);
+#if defined(__APPLE__)
   Dkc1MacSetWidescreenEdge(policy);
-  s_graphics.edge=policy; Dkc1MacSaveGraphics(&s_graphics);
+#endif
+  s_graphics.edge=policy; 
+#if defined(__APPLE__)
+  Dkc1MacSaveGraphics(&s_graphics);
+#endif
   snprintf(s_status, sizeof s_status, "level edge: %s",
            Dkc1EdgePolicyName(policy));
   UpdateTitle();
@@ -1732,7 +1820,9 @@ const char *Dkc1MacHostStatus(void) { return s_status; }
 
 void Dkc1MacAssistEnabled(int enabled) {
   s_controls.assist_enabled=enabled!=0;
+#if defined(__APPLE__)
   Dkc1MacSaveControls(&s_controls);
+#endif
   if (!enabled) ClearRewind();
   s_host_actions=s_previous_host_actions=0;
 }
@@ -1757,8 +1847,10 @@ void Dkc1MacApplyGraphics(Dkc1GraphicsSettings *settings) {
   s_graphics.aspect=Dkc1VideoGetAspect();
   s_graphics.fullscreen=s_fullscreen;
   if (audio_change) ResetAudioTimeline();
+#if defined(__APPLE__)
   Dkc1MacSaveGraphics(&s_graphics);
   Dkc1MacMetalPresenterSetGraphics(&s_graphics);
+#endif
   if (s_texture) SDL_SetTextureScaleMode(s_texture,next.upscaler==kDkc1UpscalerNearest ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
   *settings=s_graphics;
   Present(); UpdateTitle();
@@ -1776,6 +1868,10 @@ unsigned Dkc1MacPauseMenuController(void) {
 }
 
 static void OpenPauseMenu(int graphics_page) {
+#if defined(__linux__)
+  Present(); UpdateTitle();
+//  return; /* Linux native pause menu overlay pending integration. */
+#else
   if (Dkc1MacPauseMenuIsOpen()) return;
   SDL_SysWMinfo window; SDL_VERSION(&window.version);
   if (!SDL_GetWindowWMInfo(s_window,&window)) return;
@@ -1784,20 +1880,32 @@ static void OpenPauseMenu(int graphics_page) {
   if (s_audio_device) SDL_PauseAudioDevice(s_audio_device,1);
   s_graphics.aspect=Dkc1VideoGetAspect(); s_graphics.edge=Dkc1VideoGetEdgePolicy();
   s_graphics.fullscreen=s_fullscreen;
-  // Discard older packets so the menu rests on the latest completed image.
-  Dkc1MacMetalPresenterFlush(); Present(); UpdateTitle();
-  int resume=Dkc1MacShowPauseMenu(
-#ifdef _WIN32
-      window.info.win.window,
-#else
-      window.info.cocoa.window,
+  /* Discard older packets so the menu rests on the latest completed image. */
+#ifndef _WIN32
+  Dkc1MacMetalPresenterFlush();
 #endif
+  Present(); UpdateTitle();
+  
+  int resume = 0;
+#if defined(_WIN32) || defined(__linux__)
+  resume = Dkc1MacShowPauseMenu(
+      window.info.win.window,
       &s_graphics,&s_controls,graphics_page);
+#elif defined(__APPLE__)
+  resume = Dkc1MacShowPauseMenu(
+      window.info.cocoa.window,
+      &s_graphics,&s_controls,graphics_page);
+#endif
+
   s_paused=resume ? 0 : was_paused; ResetAudioTimeline();
   s_host_actions=s_previous_host_actions=0; s_input_release_gate=1;
   s_reanchor_pacer=1;
   SDL_FlushEvent(SDL_KEYDOWN); SDL_FlushEvent(SDL_KEYUP);
-  Dkc1MacMetalPresenterSetActive(1); Present(); UpdateTitle();
+#ifndef _WIN32
+  Dkc1MacMetalPresenterSetActive(1);
+#endif
+  Present(); UpdateTitle();
+#endif
 }
 
 static void HandleKey(SDL_Keycode key, SDL_Keymod mod) {
@@ -1866,7 +1974,9 @@ void Dkc1MacMenuCommand(int command) {
     case kDkc1MacMenuControls:
       StopControllerRumble();
       if (s_audio_device) SDL_PauseAudioDevice(s_audio_device, 1);
+#if defined(__APPLE__)
       Dkc1MacEditControls(&s_controls);
+#endif
       if (!s_controls.assist_enabled) ClearRewind();
       ResetAudioTimeline();
       s_host_actions = s_previous_host_actions = 0;
@@ -1905,7 +2015,9 @@ void Dkc1MacMenuCommand(int command) {
         ChooseBabyKongRom();
       } else {
         Dkc1BabyKongSetEnabled(!Dkc1BabyKongEnabled());
+#if defined(__APPLE__)
         Dkc1MacSetBabyKongEnabled(Dkc1BabyKongEnabled());
+#endif
         snprintf(s_status, sizeof s_status, "%s",
                  Dkc1BabyKongStatus());
       }
@@ -1914,16 +2026,20 @@ void Dkc1MacMenuCommand(int command) {
       ChooseBabyKongRom();
       break;
     case kDkc1MacMenuChooseMusicPack: {
+#if defined(__APPLE__)
       char *path = Dkc1MacChooseMsu1();
       if (path) {
         snprintf(s_status, sizeof s_status,
                  "music pack installed; restart DKC1Recomp to apply");
         free(path);
       }
+#endif
       break;
     }
     case kDkc1MacMenuDisableMusicPack:
+#if defined(__APPLE__)
       Dkc1MacClearMsu1();
+#endif
       snprintf(s_status, sizeof s_status,
                "replacement music disabled after restart");
       break;
@@ -2001,6 +2117,8 @@ static void PollEvents(void) {
         if (!event.key.repeat)
           HandleKey(event.key.keysym.sym, event.key.keysym.mod);
         break;
+      case SDL_KEYUP:
+        break;
       case SDL_CONTROLLERDEVICEADDED:
         OpenFirstController();
         break;
@@ -2009,14 +2127,20 @@ static void PollEvents(void) {
         break;
       case SDL_WINDOWEVENT:
         if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+#if defined(__APPLE__)
           Dkc1MacMetalPresenterSetActive(1);
+#endif
         } else if (event.window.event == SDL_WINDOWEVENT_RESTORED ||
                    event.window.event == SDL_WINDOWEVENT_SHOWN) {
+#if defined(__APPLE__)
           Dkc1MacMetalPresenterSetActive(1);
+#endif
         } else if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
                    event.window.event == SDL_WINDOWEVENT_MINIMIZED ||
                    event.window.event == SDL_WINDOWEVENT_HIDDEN) {
+#if defined(__APPLE__)
           Dkc1MacMetalPresenterSetActive(0);
+#endif
         }
         if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED ||
             event.window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
@@ -2045,10 +2169,12 @@ static void Cleanup(uint8_t *rom) {
   Dkc1InputPlaybackFree(&s_assist_test_input);
   if (s_assist_test_log) fclose(s_assist_test_log);
   ClearRewind();
+#if defined(__APPLE__)
   Dkc1MacDisplayLinkStop();
   s_display_link_active = 0;
   Dkc1MacMetalPresenterStop();
   s_metal_presenter_active = 0;
+#endif
   HapticWorkerStop();
   for (int i = 0; i < 2; i++) if (s_controllers[i]) {
     (void)SDL_GameControllerRumble(s_controllers[i], 0, 0, 0);
@@ -2071,16 +2197,18 @@ static void Cleanup(uint8_t *rom) {
 
 int main(int argc, char **argv) {
   SDL_SetMainReady();
-#ifndef _WIN32
+#if defined(__APPLE__)
   (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#else
+#elif defined(_WIN32)
   SDL_SetHint("SDL_WINDOWS_DPI_AWARENESS","permonitorv2");
 #endif
   /* A native macOS fullscreen Space constrains SDL to the panel's inset safe
    * area (3949x2464 on the target 4112x2658 MacBook display). Set this before
    * the Cocoa video backend initializes so FULLSCREEN_DESKTOP uses the full
    * borderless drawable instead. */
+#if defined(__APPLE__)
   SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+#endif
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
     fprintf(stderr, "SDL initialization failed: %s\n", SDL_GetError());
     return 3;
@@ -2132,7 +2260,9 @@ int main(int argc, char **argv) {
   }
 
   PrepareUserDirectory();
+#if defined(__APPLE__)
   Dkc1MacLoadGraphics(&s_graphics);
+#endif
   Dkc1DesktopColorFilterInit(&s_color_filter,s_graphics.screen);
   const char *aspect = getenv("DKC1_ASPECT");
   const char *widescreen = getenv("DKC1_WIDESCREEN");
@@ -2150,7 +2280,11 @@ int main(int argc, char **argv) {
   {
     /* Level-wall presentation: the View menu's saved choice (glide when
      * never set), overridden by DKC1_WIDESCREEN_EDGE for this run only. */
+#if defined(__APPLE__)
     Dkc1VideoSetEdgePolicy(Dkc1MacSavedWidescreenEdge());
+#else
+    Dkc1VideoSetEdgePolicy(kDkc1EdgeGlide);
+#endif
     const char *edge_text = getenv("DKC1_WIDESCREEN_EDGE");
     Dkc1EdgePolicy edge_policy;
     if (edge_text && *edge_text &&
@@ -2167,6 +2301,7 @@ int main(int argc, char **argv) {
   }
 
   if (!getenv("DKC1_BABY_KONG_ROM")) {
+#if defined(__APPLE__)
     char *baby_rom = Dkc1MacSavedBabyKongRom();
     if (baby_rom) {
       char baby_error[192];
@@ -2174,12 +2309,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "warning: Baby Kong disabled: %s\n", baby_error);
       free(baby_rom);
     }
+#endif
   }
   if (Dkc1BabyKongReady()) {
     const char *baby_enabled = getenv("DKC1_BABY_KONG");
+#if defined(__APPLE__)
     Dkc1BabyKongSetEnabled(
         baby_enabled ? EnvironmentEnabled("DKC1_BABY_KONG")
                      : Dkc1MacSavedBabyKongEnabled() != 0);
+#else
+    Dkc1BabyKongSetEnabled(baby_enabled ? EnvironmentEnabled("DKC1_BABY_KONG") : 0);
+#endif
   }
 
   const char *snapshot = getenv("DKC1_SAVESTATE_INPUT");
@@ -2212,7 +2352,11 @@ int main(int argc, char **argv) {
   }
 
   s_paused = EnvironmentEnabled("DKC1_START_PAUSED");
+#if defined(__APPLE__)
   s_fullscreen_scaling = Dkc1MacSavedFullscreenScaling();
+#else
+  s_fullscreen_scaling = kDkc1MacFullscreenSharpBilinear;
+#endif
   s_haptics_enabled = !getenv("DKC1_HAPTICS") ||
                       EnvironmentEnabled("DKC1_HAPTICS");
   if (!HapticWorkerStart()) {
@@ -2240,8 +2384,14 @@ int main(int argc, char **argv) {
     Cleanup(rom);
     return 3;
   }
+#if defined(__APPLE__)
   Dkc1MacLoadControls(&s_controls);
   Dkc1MacInstallMenu();
+#endif
+#if defined(__linux__)
+  LinuxDefaults(&s_controls);
+#endif
+
   InitAudio();
   OpenFirstController();
 
@@ -2374,7 +2524,7 @@ int main(int argc, char **argv) {
     uint32_t live_input = PollInput();
     if (s_assist_test_input.count)
       s_host_actions = Dkc1InputPlaybackFrame(&s_assist_test_input,
-                                              (size_t)s_assist_test_tick);
+                                             (size_t)s_assist_test_tick);
     s_assist_test_tick++;
     uint32_t pressed_actions = s_host_actions & ~s_previous_host_actions;
     s_previous_host_actions = s_host_actions;
@@ -2443,8 +2593,8 @@ int main(int argc, char **argv) {
                        kDkc1VideoHeight, Dkc1VideoTerrainReady());
     Dkc1InvariantMonitorFrame(s_host_frame);
     if (!Dkc1WramDumpFrame(&s_wram_dump, s_host_frame,
-                           snes_frame_counter, g_ram,
-                           error, sizeof error)) {
+                            snes_frame_counter, g_ram,
+                            error, sizeof error)) {
       snprintf(s_status, sizeof s_status, "WRAM dump failed: %.180s", error);
       s_paused = 1;
     }
@@ -2486,7 +2636,8 @@ int main(int argc, char **argv) {
     pacing_log.render_ms = work_profile.ppu * 1000.0 / pacer.frequency;
     pacing_log.diagnostics_ms =
         work_profile.diagnostics * 1000.0 / pacer.frequency;
-    pacing_log.audio_ms = work_profile.audio * 1000.0 / pacer.frequency;
+    pacing_log.audio_ms =
+        work_profile.audio * 1000.0 / pacer.frequency;
     PacingLogInjectTestStall(&pacing_log, s_host_frame);
 
     /* CADisplayLink wakes one interval before a concrete targetTimestamp.

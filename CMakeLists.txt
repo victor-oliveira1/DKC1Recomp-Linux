@@ -5,6 +5,7 @@ project(dkc1_port
     DESCRIPTION "Native PC recompilation of Donkey Kong Country"
     LANGUAGES C)
 
+add_compile_definitions(_GNU_SOURCE)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -222,4 +223,58 @@ if(WIN32)
     add_test(NAME windows_platform COMMAND dkc1_windows --platform-test ${CMAKE_CURRENT_BINARY_DIR}/music-test)
     set_source_files_properties(runner/windows_platform.c runner/windows_graphics.c
         runner/windows_music_pack.c PROPERTIES COMPILE_OPTIONS "/W4;/WX")
+endif()
+
+if(UNIX AND NOT APPLE)
+    find_package(SDL2 REQUIRED)
+    find_package(OpenGL REQUIRED)
+
+    add_executable(dkc1_linux
+        ${DKC1_ENGINE_SOURCES}
+        ${DKC1_SNESRECOMP_GEN_SOURCES}
+        ${DKC1_RUNNER_SOURCES}
+        runner/headless_host.c
+        runner/sdl_host.c
+        runner/dkc1_haptics.c
+        runner/dkc1_msu1.c
+        runner/desktop_audio_rate.c
+        runner/desktop_rewind.c
+        runner/desktop_input.c
+        runner/desktop_refresh.c
+        runner/desktop_crt.c
+        runner/desktop_filter.c
+        runner/desktop_graphics.c
+    )
+    target_sources(dkc1_linux PRIVATE runner/linux_platform.c)
+    target_include_directories(dkc1_linux PRIVATE
+        runner
+        recomp
+        ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/snesrecomp/runner/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/snesrecomp/runner/src/desktop
+    )
+    target_compile_definitions(dkc1_linux PRIVATE
+        SNESRECOMP_TRACE=0
+        SNESRECOMP_REVERSE_DEBUG=0
+        SNESRECOMP_EXTERNAL_RAM_ROUTINE_GUARDS=1
+        SYSTEM_VOLUME_MIXER_AVAILABLE=0
+        DKC1_BUILD_COMMIT="${DKC1_BUILD_COMMIT}"
+        DKC1_BUILD_CONFIG="linux-${PROJECT_VERSION}"
+    )
+    target_link_libraries(dkc1_linux PRIVATE
+        ${SNESRECOMP_RUNNER_LIBRARIES}
+        SDL2::SDL2
+        OpenGL::GL
+        m
+        dl
+        pthread
+    )
+    target_compile_definitions(dkc1_linux PRIVATE SDL_MAIN_HANDLED
+        SNESRECOMP_TRACE=0 SNESRECOMP_REVERSE_DEBUG=0
+        SNESRECOMP_EXTERNAL_RAM_ROUTINE_GUARDS=1 SYSTEM_VOLUME_MIXER_AVAILABLE=0
+    )
+    snesrecomp_target_sdl(dkc1_linux)
+    set_target_properties(dkc1_linux PROPERTIES
+        OUTPUT_NAME "DKC1Recomp"
+    )
 endif()
